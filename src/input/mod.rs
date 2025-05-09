@@ -593,29 +593,7 @@ impl State {
                 }
             }
             Action::ConfirmScreenshot { write_to_disk } => {
-                if !self.niri.screenshot_ui.is_open() {
-                    return;
-                }
-
-                self.backend.with_primary_renderer(|renderer| {
-                    match self.niri.screenshot_ui.capture(renderer) {
-                        Ok((size, pixels)) => {
-                            if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk)
-                            {
-                                warn!("error saving screenshot: {err:?}");
-                            }
-                        }
-                        Err(err) => {
-                            warn!("error capturing screenshot: {err:?}");
-                        }
-                    }
-                });
-
-                self.niri.screenshot_ui.close();
-                self.niri
-                    .cursor_manager
-                    .set_cursor_image(CursorImageStatus::default_named());
-                self.niri.queue_redraw_all();
+                self.confirm_screenshot(write_to_disk);
             }
             Action::CancelScreenshot => {
                 if !self.niri.screenshot_ui.is_open() {
@@ -2112,7 +2090,7 @@ impl State {
             point.x = point.x.clamp(0, size.w - 1);
             point.y = point.y.clamp(0, size.h - 1);
 
-            self.niri.screenshot_ui.pointer_motion(point);
+            self.niri.screenshot_ui.pointer_motion(point, None);
         }
 
         let under = self.niri.contents_under(new_pos);
@@ -2245,7 +2223,7 @@ impl State {
             point.x = point.x.clamp(0, size.w - 1);
             point.y = point.y.clamp(0, size.h - 1);
 
-            self.niri.screenshot_ui.pointer_motion(point);
+            self.niri.screenshot_ui.pointer_motion(point, None);
         }
 
         let under = self.niri.contents_under(pos);
@@ -2563,26 +2541,30 @@ impl State {
             self.niri.focus_layer_surface_if_on_demand(layer_under);
         }
 
-        if let Some(button) = button {
-            let pos = pointer.current_location();
-            if let Some((output, _)) = self.niri.output_under(pos) {
-                let output = output.clone();
-                let geom = self.niri.global_space.output_geometry(&output).unwrap();
-                let mut point = (pos - geom.loc.to_f64())
-                    .to_physical(output.current_scale().fractional_scale())
-                    .to_i32_round();
+        if button == Some(MouseButton::Left) && self.niri.screenshot_ui.is_open() {
+            if button_state == ButtonState::Pressed {
+                let pos = pointer.current_location();
+                if let Some((output, _)) = self.niri.output_under(pos) {
+                    let output = output.clone();
+                    let geom = self.niri.global_space.output_geometry(&output).unwrap();
+                    let mut point = (pos - geom.loc.to_f64())
+                        .to_physical(output.current_scale().fractional_scale())
+                        .to_i32_round();
 
-                let size = output.current_mode().unwrap().size;
-                let transform = output.current_transform();
-                let size = transform.transform_size(size);
-                point.x = min(size.w - 1, point.x);
-                point.y = min(size.h - 1, point.y);
+                    let size = output.current_mode().unwrap().size;
+                    let transform = output.current_transform();
+                    let size = transform.transform_size(size);
+                    point.x = min(size.w - 1, point.x);
+                    point.y = min(size.h - 1, point.y);
 
-                if self
-                    .niri
-                    .screenshot_ui
-                    .pointer_button(output, point, button, button_state)
-                {
+                    if self.niri.screenshot_ui.pointer_down(output, point, None) {
+                        self.niri.queue_redraw_all();
+                    }
+                }
+            } else if let Some(capture) = self.niri.screenshot_ui.pointer_up(None) {
+                if capture {
+                    self.confirm_screenshot(true);
+                } else {
                     self.niri.queue_redraw_all();
                 }
             }
@@ -3022,6 +3004,21 @@ impl State {
             return;
         };
 
+        if let Some(output) = self.niri.screenshot_ui.selection_output() {
+            let geom = self.niri.global_space.output_geometry(output).unwrap();
+            let mut point = (pos - geom.loc.to_f64())
+                .to_physical(output.current_scale().fractional_scale())
+                .to_i32_round::<i32>();
+
+            let size = output.current_mode().unwrap().size;
+            let transform = output.current_transform();
+            let size = transform.transform_size(size);
+            point.x = point.x.clamp(0, size.w - 1);
+            point.y = point.y.clamp(0, size.h - 1);
+
+            self.niri.screenshot_ui.pointer_motion(point, None);
+        }
+
         let under = self.niri.contents_under(pos);
 
         let tablet_seat = self.niri.seat.tablet_seat();
@@ -3067,56 +3064,84 @@ impl State {
     fn on_tablet_tool_tip<I: InputBackend>(&mut self, event: I::TabletToolTipEvent) {
         let tool = self.niri.seat.tablet_seat().get_tool(&event.tool());
 
-        if let Some(tool) = tool {
-            let is_overview_open = self.niri.layout.is_overview_open();
+        let Some(tool) = tool else {
+            return;
+        };
+        let tip_state = event.tip_state();
 
-            match event.tip_state() {
-                TabletToolTipState::Down => {
-                    let serial = SERIAL_COUNTER.next_serial();
-                    tool.tip_down(serial, event.time_msec());
+        let is_overview_open = self.niri.layout.is_overview_open();
 
-                    if let Some(pos) = self.niri.tablet_cursor_location {
-                        let under = self.niri.contents_under(pos);
-                        if let Some((window, _)) = under.window {
-                            if let Some(output) = is_overview_open.then_some(under.output).flatten()
-                            {
-                                let mut workspaces = self.niri.layout.workspaces();
-                                if let Some(ws_idx) = workspaces.find_map(|(_, ws_idx, ws)| {
-                                    ws.windows().any(|w| w.window == window).then_some(ws_idx)
-                                }) {
-                                    drop(workspaces);
-                                    self.niri.layout.focus_output(&output);
-                                    self.niri.layout.toggle_overview_to_workspace(ws_idx);
-                                }
+        match tip_state {
+            TabletToolTipState::Down => {
+                let serial = SERIAL_COUNTER.next_serial();
+                tool.tip_down(serial, event.time_msec());
+
+                if let Some(pos) = self.niri.tablet_cursor_location {
+                    let under = self.niri.contents_under(pos);
+
+                    if self.niri.screenshot_ui.is_open() {
+                        if let Some(output) = under.output.clone() {
+                            let geom = self.niri.global_space.output_geometry(&output).unwrap();
+                            let mut point = (pos - geom.loc.to_f64())
+                                .to_physical(output.current_scale().fractional_scale())
+                                .to_i32_round();
+
+                            let size = output.current_mode().unwrap().size;
+                            let transform = output.current_transform();
+                            let size = transform.transform_size(size);
+                            point.x = min(size.w - 1, point.x);
+                            point.y = min(size.h - 1, point.y);
+
+                            if self.niri.screenshot_ui.pointer_down(output, point, None) {
+                                self.niri.queue_redraw_all();
                             }
-
-                            self.niri.layout.activate_window(&window);
-
-                            // FIXME: granular.
-                            self.niri.queue_redraw_all();
-                        } else if let Some((output, ws)) = is_overview_open
-                            .then(|| self.niri.workspace_under(false, pos))
-                            .flatten()
-                        {
-                            let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
-
-                            self.niri.layout.focus_output(&output);
-                            self.niri.layout.toggle_overview_to_workspace(ws_idx);
-
-                            // FIXME: granular.
-                            self.niri.queue_redraw_all();
-                        } else if let Some(output) = under.output {
-                            self.niri.layout.focus_output(&output);
-
-                            // FIXME: granular.
-                            self.niri.queue_redraw_all();
                         }
-                        self.niri.focus_layer_surface_if_on_demand(under.layer);
+                    } else if let Some((window, _)) = under.window {
+                        if let Some(output) = is_overview_open.then_some(under.output).flatten() {
+                            let mut workspaces = self.niri.layout.workspaces();
+                            if let Some(ws_idx) = workspaces.find_map(|(_, ws_idx, ws)| {
+                                ws.windows().any(|w| w.window == window).then_some(ws_idx)
+                            }) {
+                                drop(workspaces);
+                                self.niri.layout.focus_output(&output);
+                                self.niri.layout.toggle_overview_to_workspace(ws_idx);
+                            }
+                        }
+
+                        self.niri.layout.activate_window(&window);
+
+                        // FIXME: granular.
+                        self.niri.queue_redraw_all();
+                    } else if let Some((output, ws)) = is_overview_open
+                        .then(|| self.niri.workspace_under(false, pos))
+                        .flatten()
+                    {
+                        let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
+
+                        self.niri.layout.focus_output(&output);
+                        self.niri.layout.toggle_overview_to_workspace(ws_idx);
+
+                        // FIXME: granular.
+                        self.niri.queue_redraw_all();
+                    } else if let Some(output) = under.output {
+                        self.niri.layout.focus_output(&output);
+
+                        // FIXME: granular.
+                        self.niri.queue_redraw_all();
+                    }
+                    self.niri.focus_layer_surface_if_on_demand(under.layer);
+                }
+            }
+            TabletToolTipState::Up => {
+                if let Some(capture) = self.niri.screenshot_ui.pointer_up(None) {
+                    if capture {
+                        self.confirm_screenshot(true);
+                    } else {
+                        self.niri.queue_redraw_all();
                     }
                 }
-                TabletToolTipState::Up => {
-                    tool.tip_up(event.time_msec());
-                }
+
+                tool.tip_up(event.time_msec());
             }
         }
     }
@@ -3500,40 +3525,62 @@ impl State {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
-        let Some(touch_location) = self.compute_touch_location(&evt) else {
+        let Some(pos) = self.compute_touch_location(&evt) else {
             return;
         };
+        let slot = evt.slot();
 
         let serial = SERIAL_COUNTER.next_serial();
 
-        let under = self.niri.contents_under(touch_location);
+        let under = self.niri.contents_under(pos);
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
-        if !handle.is_grabbed() {
+        if self.niri.screenshot_ui.is_open() {
+            if let Some(output) = under.output.clone() {
+                let geom = self.niri.global_space.output_geometry(&output).unwrap();
+                let mut point = (pos - geom.loc.to_f64())
+                    .to_physical(output.current_scale().fractional_scale())
+                    .to_i32_round();
+
+                let size = output.current_mode().unwrap().size;
+                let transform = output.current_transform();
+                let size = transform.transform_size(size);
+                point.x = min(size.w - 1, point.x);
+                point.y = min(size.h - 1, point.y);
+
+                if self
+                    .niri
+                    .screenshot_ui
+                    .pointer_down(output, point, Some(slot))
+                {
+                    self.niri.queue_redraw_all();
+                }
+            }
+        } else if !handle.is_grabbed() {
             let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
             let mods = modifiers_from_state(mods);
             let mod_down = mods.contains(mod_key.to_modifiers());
 
             if self.niri.layout.is_overview_open() && !mod_down && under.layer.is_none() {
-                let (output, pos_within_output) = self.niri.output_under(touch_location).unwrap();
+                let (output, pos_within_output) = self.niri.output_under(pos).unwrap();
                 let output = output.clone();
 
                 let mut matched_narrow = true;
-                let mut ws = self.niri.workspace_under(false, touch_location);
+                let mut ws = self.niri.workspace_under(false, pos);
                 if ws.is_none() {
                     matched_narrow = false;
-                    ws = self.niri.workspace_under(true, touch_location);
+                    ws = self.niri.workspace_under(true, pos);
                 }
                 let ws_id = ws.map(|(_, ws)| ws.id());
 
-                let mapped = self.niri.window_under(touch_location);
+                let mapped = self.niri.window_under(pos);
                 let window = mapped.map(|mapped| mapped.window.clone());
 
                 let start_data = TouchGrabStartData {
                     focus: None,
-                    slot: evt.slot(),
-                    location: touch_location,
+                    slot,
+                    location: pos,
                 };
                 let start_timestamp = Duration::from_micros(evt.time());
                 let grab = TouchOverviewGrab::new(
@@ -3551,8 +3598,7 @@ impl State {
 
                 // Check if we need to start an interactive move.
                 if mod_down {
-                    let (output, pos_within_output) =
-                        self.niri.output_under(touch_location).unwrap();
+                    let (output, pos_within_output) = self.niri.output_under(pos).unwrap();
                     let output = output.clone();
 
                     if self.niri.layout.interactive_move_begin(
@@ -3562,8 +3608,8 @@ impl State {
                     ) {
                         let start_data = TouchGrabStartData {
                             focus: None,
-                            slot: evt.slot(),
-                            location: touch_location,
+                            slot,
+                            location: pos,
                         };
                         let grab = TouchMoveGrab::new(start_data, window.clone());
                         handle.set_grab(self, grab, serial);
@@ -3585,8 +3631,8 @@ impl State {
             self,
             under.surface,
             &DownEvent {
-                slot: evt.slot(),
-                location: touch_location,
+                slot,
+                location: pos,
                 serial,
                 time: evt.time_msec(),
             },
@@ -3599,11 +3645,21 @@ impl State {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
+        let slot = evt.slot();
+
+        if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
+            if capture {
+                self.confirm_screenshot(true);
+            } else {
+                self.niri.queue_redraw_all();
+            }
+        }
+
         let serial = SERIAL_COUNTER.next_serial();
         handle.up(
             self,
             &UpEvent {
-                slot: evt.slot(),
+                slot,
                 serial,
                 time: evt.time_msec(),
             },
@@ -3613,16 +3669,34 @@ impl State {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
-        let Some(touch_location) = self.compute_touch_location(&evt) else {
+        let Some(pos) = self.compute_touch_location(&evt) else {
             return;
         };
-        let under = self.niri.contents_under(touch_location);
+        let slot = evt.slot();
+
+        if let Some(output) = self.niri.screenshot_ui.selection_output().cloned() {
+            let geom = self.niri.global_space.output_geometry(&output).unwrap();
+            let mut point = (pos - geom.loc.to_f64())
+                .to_physical(output.current_scale().fractional_scale())
+                .to_i32_round::<i32>();
+
+            let size = output.current_mode().unwrap().size;
+            let transform = output.current_transform();
+            let size = transform.transform_size(size);
+            point.x = point.x.clamp(0, size.w - 1);
+            point.y = point.y.clamp(0, size.h - 1);
+
+            self.niri.screenshot_ui.pointer_motion(point, Some(slot));
+            self.niri.queue_redraw(&output);
+        }
+
+        let under = self.niri.contents_under(pos);
         handle.motion(
             self,
             under.surface,
             &TouchMotionEvent {
-                slot: evt.slot(),
-                location: touch_location,
+                slot,
+                location: pos,
                 time: evt.time_msec(),
             },
         );
@@ -3633,7 +3707,7 @@ impl State {
             is_dnd_grab = grab.as_any().downcast_ref::<DnDGrab<Self>>().is_some();
         });
         if is_dnd_grab {
-            if let Some((output, pos_within_output)) = self.niri.output_under(touch_location) {
+            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
                 let output = output.clone();
                 self.niri.layout.dnd_update(output, pos_within_output);
             }
